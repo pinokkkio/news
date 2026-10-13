@@ -395,6 +395,59 @@ def pick_stories(clusters, state, idf, dry_run):
     return picked
 
 
+# Набор выдуманных сюжетов для проверки модели: (сообщения изданий, мин. и макс. ожидаемая оценка)
+TEST_CASES = [
+    (["Объявлена частичная мобилизация", "Путин подписал указ о частичной мобилизации",
+      "В России начинается мобилизация резервистов"], 9, 10),
+    (["Курс доллара превысил 150 рублей впервые в истории", "Рубль обвалился на 30% за день",
+      "ЦБ ввёл экстренные меры из-за обвала рубля"], 8, 10),
+    (["Банк России повысил ключевую ставку до 21%", "ЦБ неожиданно поднял ставку на 2 п.п.",
+      "Ключевая ставка выросла до 21% годовых"], 7, 10),
+    (["Госдума приняла закон о повышении НДС до 22% с 1 января",
+      "НДС вырастет до 22%: закон принят в третьем чтении", "Депутаты одобрили повышение НДС"], 7, 10),
+    (["Роскомнадзор полностью заблокировал WhatsApp в России", "WhatsApp перестал работать у россиян",
+      "РКН подтвердил блокировку WhatsApp"], 7, 10),
+    (["Землетрясение магнитудой 6,1 произошло у берегов Чили", "В Чили зафиксировали землетрясение",
+      "Подземные толчки у побережья Чили, жертв нет"], 1, 6),
+    (["Лавров провёл переговоры с министром иностранных дел Бразилии",
+      "Глава МИД России встретился с бразильским коллегой", "Лавров и Виейра обсудили сотрудничество"], 1, 6),
+    (["Известная певица вышла замуж в третий раз", "Звезда эстрады сыграла свадьбу на Мальдивах",
+      "Певица показала фото со свадьбы"], 1, 3),
+    (["Сборная России по хоккею обыграла Беларусь в товарищеском матче", "Хоккеисты России победили Беларусь 4:2",
+      "Россия выиграла у Беларуси в хоккей"], 1, 4),
+    (["Песков: Кремль не комментирует слухи об отставке министра", "В Кремле отказались комментировать слухи",
+      "Песков ответил на вопрос об отставке"], 1, 6),
+]
+
+
+def test_model():
+    """Прогоняет тестовые сюжеты через нейросеть и показывает, насколько разумны оценки."""
+    if not os.environ.get("OLLAMA_URL"):
+        sys.exit("Не задан OLLAMA_URL — нейросеть не настроена")
+    ensure_model()
+    print(f"Модель: {os.environ.get('OLLAMA_MODEL', 'qwen2.5:3b')}\n")
+    ok, total_time = 0, 0.0
+    for titles, lo, hi in TEST_CASES:
+        members = [{"source": f"s{i}", "source_name": f"Издание {i + 1}", "title": t, "summary": "",
+                    "link": f"https://example.com/{i}"} for i, t in enumerate(titles)]
+        cluster = {"members": members, "main": members[0], "sources": {m["source"] for m in members}}
+        started = time.time()
+        a = assess(cluster)
+        total_time += time.time() - started
+        if a is None:
+            print(f"ОШИБКА  {titles[0]}\n")
+            continue
+        good = lo <= a["importance"] <= hi
+        ok += good
+        print(f"{'OK    ' if good else 'МИМО  '} {a['importance']:2d}/10 (ожидалось {lo}–{hi})  {titles[0]}")
+        print(f"       почему: {a['reason']}")
+        print(f"       пост:   {a['headline']} — {a['text']}\n")
+    n = len(TEST_CASES)
+    print(f"Итог: {ok}/{n} оценок в ожидаемом диапазоне, в среднем {total_time / n:.0f} с на сюжет")
+    if ok < n * 0.7:
+        print("Модель оценивает неточно. Попробуйте OLLAMA_MODEL=qwen2.5:7b (нужно ~8 ГБ памяти).")
+
+
 def run_once(dry_run):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHANNEL_ID")
@@ -440,6 +493,8 @@ def main():
                         help="ничего не отправлять, показать самые крупные сюжеты")
     parser.add_argument("--check-feeds", action="store_true",
                         help="проверить, какие ленты из feeds.txt работают")
+    parser.add_argument("--test-model", action="store_true",
+                        help="проверить, как нейросеть оценивает важность на тестовых сюжетах")
     parser.add_argument("--loop", action="store_true",
                         help="работать постоянно, запускаясь каждые INTERVAL_MINUTES минут")
     args = parser.parse_args()
@@ -449,6 +504,9 @@ def main():
         return
 
     load_env()
+    if args.test_model:
+        test_model()
+        return
     if not args.dry_run and not (os.environ.get("TELEGRAM_BOT_TOKEN")
                                  and os.environ.get("TELEGRAM_CHANNEL_ID")):
         sys.exit("Задайте TELEGRAM_BOT_TOKEN и TELEGRAM_CHANNEL_ID в .env")
