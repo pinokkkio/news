@@ -1,0 +1,12 @@
+# Дополнение к docker-compose.yml: запуск нейросети на видеокарте NVIDIA.
+# Включается строкой USE_GPU=1 в .env (run.sh подключит этот файл сам).
+# Нужен драйвер NVIDIA и nvidia-container-toolkit, проверка: ./run.sh gpu
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
