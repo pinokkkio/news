@@ -1,0 +1,21 @@
+services:
+  bot:
+    build: .
+    env_file: .env
+    environment:
+      OLLAMA_URL: http://ollama:11434
+    volumes:
+      - ./data:/app/data               # state.json: что уже опубликовано
+      - ./feeds.txt:/app/feeds.txt:ro  # список лент можно править без пересборки
+    depends_on:
+      - ollama
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama:/root/.ollama           # скачанная модель хранится здесь
+    restart: unless-stopped
+
+volumes:
+  ollama:

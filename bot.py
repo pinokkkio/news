@@ -6,7 +6,12 @@
 событие, если его подхватило не меньше MIN_SOURCES разных источников. Если таких нет —
 ничего не пишет.
 
-Запускайте периодически (cron / планировщик задач). Состояние хранится в state.json.
+Если задан OLLAMA_URL, локальная нейросеть (Ollama) переписывает новость:
+короткий заголовок и 2–3 предложения о том, что произошло. Без неё публикуется
+заголовок и описание из ленты.
+
+Запускайте периодически (cron / планировщик задач) или с флагом --loop (так работает
+docker-контейнер). Состояние хранится в state.json.
 """
 
 import argparse
@@ -26,8 +31,9 @@ from pathlib import Path
 import feedparser
 
 BASE_DIR = Path(__file__).resolve().parent
-STATE_FILE = BASE_DIR / "state.json"
-FEEDS_FILE = BASE_DIR / "feeds.txt"
+DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR))
+STATE_FILE = DATA_DIR / "state.json"
+FEEDS_FILE = Path(os.environ.get("FEEDS_FILE", BASE_DIR / "feeds.txt"))
 ENV_FILE = BASE_DIR / ".env"
 
 POSTED_MEMORY = 48 * 3600         # сколько помнить опубликованные события (против повторов)
@@ -195,18 +201,96 @@ def already_posted(cluster, posted, idf):
     return False
 
 
-def format_post(cluster):
-    main = cluster["main"]
-    text = f"<b>{html.escape(main['title'])}</b>"
-    if main["summary"] and not main["summary"].startswith(main["title"]):
-        text += f"\n\n{html.escape(main['summary'])}"
-    links, seen = [], set()
+def unique_by_source(cluster):
+    """По одной новости от каждого источника, «главная» — первой."""
+    main, result, seen = cluster["main"], [], set()
     for m in sorted(cluster["members"], key=lambda m: m is not main):
-        if m["source"] in seen:
-            continue
-        seen.add(m["source"])
-        links.append(f'<a href="{html.escape(m["link"])}">{html.escape(m["source_name"])}</a>')
-    text += f"\n\nИсточников: {len(seen)} — " + " · ".join(links[:6])
+        if m["source"] not in seen:
+            seen.add(m["source"])
+            result.append(m)
+    return result
+
+
+REWRITE_PROMPT = """Ты — редактор новостного телеграм-канала. Ниже сообщения разных изданий
+об одном и том же событии. Напиши по-русски:
+- headline: короткий нейтральный заголовок (до 100 символов);
+- text: 2–3 предложения о том, что произошло и почему это важно.
+Используй только факты из сообщений, ничего не придумывай. Без оценок, эмоций и кликбейта.
+Если издания расходятся в деталях, укажи только то, в чём они сходятся."""
+
+REWRITE_SCHEMA = {
+    "type": "object",
+    "properties": {"headline": {"type": "string"}, "text": {"type": "string"}},
+    "required": ["headline", "text"],
+}
+
+
+def ollama_request(path, body, timeout):
+    url = os.environ["OLLAMA_URL"].rstrip("/") + path
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+def ensure_model():
+    """Ждёт запуска Ollama и скачивает модель, если её ещё нет (один раз, ~2 ГБ)."""
+    if not os.environ.get("OLLAMA_URL"):
+        return
+    model = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
+    for attempt in range(30):
+        try:
+            print(f"Проверяю модель {model} (при первом запуске скачивание займёт время)...")
+            ollama_request("/api/pull", {"model": model, "stream": False}, timeout=3600)
+            print("Модель готова")
+            return
+        except Exception as e:
+            print(f"[warn] Ollama недоступна ({e}), повтор через 10 с", file=sys.stderr)
+            time.sleep(10)
+
+
+def rewrite(cluster):
+    """Пересказ сюжета локальной нейросетью. None — если она не настроена или сбоит."""
+    if not os.environ.get("OLLAMA_URL"):
+        return None
+    material = "\n".join(
+        f"- {m['source_name']}: {m['title']}. {m['summary']}" for m in unique_by_source(cluster)[:8]
+    )
+    try:
+        result = ollama_request("/api/chat", {
+            "model": os.environ.get("OLLAMA_MODEL", "qwen2.5:3b"),
+            "messages": [
+                {"role": "system", "content": REWRITE_PROMPT},
+                {"role": "user", "content": material},
+            ],
+            "format": REWRITE_SCHEMA,
+            "stream": False,
+            "options": {"temperature": 0.2},
+        }, timeout=600)
+        data = json.loads(result["message"]["content"])
+        headline, text = data["headline"].strip(), data["text"].strip()
+        if not headline or not text:
+            return None
+        return headline[:200], text[:1500]
+    except Exception as e:
+        print(f"[warn] нейросеть не сработала, публикую без пересказа: {e}", file=sys.stderr)
+        return None
+
+
+def format_post(cluster, rewritten=None):
+    main = cluster["main"]
+    if rewritten:
+        headline, body = rewritten
+    else:
+        headline = main["title"]
+        body = main["summary"] if not main["summary"].startswith(main["title"]) else ""
+    text = f"<b>{html.escape(headline)}</b>"
+    if body:
+        text += f"\n\n{html.escape(body)}"
+    sources = unique_by_source(cluster)
+    links = [f'<a href="{html.escape(m["link"])}">{html.escape(m["source_name"])}</a>'
+             for m in sources[:6]]
+    text += f"\n\nИсточников: {len(sources)} — " + " · ".join(links)
     return text
 
 
@@ -234,26 +318,12 @@ def check_feeds():
             print(f"ОШИБКА      {url}  ({e})")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Постит важные новости в телеграм-канал")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="ничего не отправлять, показать самые крупные сюжеты")
-    parser.add_argument("--check-feeds", action="store_true",
-                        help="проверить, какие ленты из feeds.txt работают")
-    args = parser.parse_args()
-
-    if args.check_feeds:
-        check_feeds()
-        return
-
-    load_env()
+def run_once(dry_run):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHANNEL_ID")
     min_sources = int(os.environ.get("MIN_SOURCES", "5"))
     max_posts = int(os.environ.get("MAX_POSTS", "3"))
     window = float(os.environ.get("WINDOW_HOURS", "6")) * 3600
-    if not args.dry_run and (not token or not chat_id):
-        sys.exit("Задайте TELEGRAM_BOT_TOKEN и TELEGRAM_CHANNEL_ID в .env")
 
     state = load_state()
     # копим новости между запусками: ленты отдают лишь последние N записей
@@ -263,11 +333,15 @@ def main():
     clusters, idf = build_clusters(items)
     print(f"Новостей за окно: {len(items)}, сюжетов: {len(clusters)}")
 
-    if args.dry_run:
+    if dry_run:
         print(f"\nКрупнейшие сюжеты (публикуются при {min_sources}+ источниках):")
         for c in clusters[:10]:
             mark = "уже было" if already_posted(c, state["posted"], idf) else ""
             print(f"  {len(c['sources']):2d} ист. | {c['main']['title']}  {mark}")
+        top = next((c for c in clusters if len(c["sources"]) >= min_sources), None)
+        if top and os.environ.get("OLLAMA_URL"):
+            print("\nПример поста для первого сюжета:\n")
+            print(format_post(top, rewrite(top)))
         return
 
     posted = 0
@@ -276,7 +350,7 @@ def main():
             break
         if already_posted(c, state["posted"], idf):
             continue
-        send_telegram(token, chat_id, format_post(c))
+        send_telegram(token, chat_id, format_post(c, rewrite(c)))
         posted += 1
         state["posted"].append({
             "time": time.time(),
@@ -287,6 +361,41 @@ def main():
         time.sleep(1)
     print(f"Опубликовано: {posted}")
     save_state(state, window)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Постит важные новости в телеграм-канал")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="ничего не отправлять, показать самые крупные сюжеты")
+    parser.add_argument("--check-feeds", action="store_true",
+                        help="проверить, какие ленты из feeds.txt работают")
+    parser.add_argument("--loop", action="store_true",
+                        help="работать постоянно, запускаясь каждые INTERVAL_MINUTES минут")
+    args = parser.parse_args()
+
+    if args.check_feeds:
+        check_feeds()
+        return
+
+    load_env()
+    if not args.dry_run and not (os.environ.get("TELEGRAM_BOT_TOKEN")
+                                 and os.environ.get("TELEGRAM_CHANNEL_ID")):
+        sys.exit("Задайте TELEGRAM_BOT_TOKEN и TELEGRAM_CHANNEL_ID в .env")
+
+    if not args.loop:
+        run_once(args.dry_run)
+        return
+
+    interval = float(os.environ.get("INTERVAL_MINUTES", "30")) * 60
+    ensure_model()
+    while True:
+        print(time.strftime("%Y-%m-%d %H:%M:%S"), "— запуск")
+        try:
+            run_once(args.dry_run)
+        except Exception as e:
+            print(f"[error] {e}", file=sys.stderr)
+        sys.stdout.flush()
+        time.sleep(interval)
 
 
 if __name__ == "__main__":

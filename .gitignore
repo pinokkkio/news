@@ -4,3 +4,4 @@ state.tmp
 .venv/
 __pycache__/
 *.log
+data/
