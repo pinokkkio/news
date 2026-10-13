@@ -6,9 +6,10 @@
 событие, если его подхватило не меньше MIN_SOURCES разных источников. Если таких нет —
 ничего не пишет.
 
-Если задан OLLAMA_URL, локальная нейросеть (Ollama) переписывает новость:
-короткий заголовок и 2–3 предложения о том, что произошло. Без неё публикуется
-заголовок и описание из ленты.
+Если задан OLLAMA_URL, локальная нейросеть (Ollama) дополнительно оценивает важность
+сюжета для жителя России (1–10) и переписывает новость: короткий заголовок и 2–3
+предложения о том, что произошло. Публикуется только то, что набрало MIN_IMPORTANCE.
+Без нейросети публикуется заголовок и описание из ленты.
 
 Запускайте периодически (cron / планировщик задач) или с флагом --loop (так работает
 docker-контейнер). Состояние хранится в state.json.
@@ -36,7 +37,10 @@ STATE_FILE = DATA_DIR / "state.json"
 FEEDS_FILE = Path(os.environ.get("FEEDS_FILE", BASE_DIR / "feeds.txt"))
 ENV_FILE = BASE_DIR / ".env"
 
-POSTED_MEMORY = 48 * 3600         # сколько помнить опубликованные события (против повторов)
+POSTED_MEMORY = 48 * 3600         # сколько помнить опубликованные/отклонённые сюжеты
+MAX_ASSESS = 10                   # сколько сюжетов максимум оценивать нейросетью за запуск
+REASSESS_GROWTH = 3               # отклонённый сюжет оценить заново, если источников стало на 3+ больше
+NO_LLM_MIN_SOURCES = 5            # порог источников, когда нейросеть не настроена или сбоит
 SIMILARITY = 0.5                  # порог похожести двух заголовков (0..1)
 USER_AGENT = "Mozilla/5.0 (news-telegram-bot)"
 
@@ -72,14 +76,16 @@ def load_state():
         state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         state.setdefault("items", {})
         state.setdefault("posted", [])
+        state.setdefault("rejected", [])
         return state
-    return {"items": {}, "posted": []}
+    return {"items": {}, "posted": [], "rejected": []}
 
 
 def save_state(state, window):
     now = time.time()
     state["items"] = {k: v for k, v in state["items"].items() if now - v["published"] < window}
-    state["posted"] = [p for p in state["posted"] if now - p["time"] < POSTED_MEMORY]
+    for key in ("posted", "rejected"):
+        state[key] = [p for p in state[key] if now - p["time"] < POSTED_MEMORY]
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
     tmp.replace(STATE_FILE)
@@ -189,16 +195,27 @@ def build_clusters(items):
     return clusters, idf
 
 
-def already_posted(cluster, posted, idf):
+def find_same(cluster, records, idf):
+    """Ищет среди записей (опубликованных/отклонённых) тот же сюжет."""
     links = {m["link"] for m in cluster["members"]}
-    for p in posted:
+    for p in records:
         if links & set(p["links"]):
-            return True
+            return p
         for t in p["titles"]:
             t = set(t)
             if any(similarity(m["tokens"], t, idf) >= SIMILARITY for m in cluster["members"]):
-                return True
-    return False
+                return p
+    return None
+
+
+def remember(cluster, **extra):
+    return {
+        "time": time.time(),
+        "links": [m["link"] for m in cluster["members"]],
+        "titles": [sorted(m["tokens"]) for m in cluster["members"]],
+        "sources": len(cluster["sources"]),
+        **extra,
+    }
 
 
 def unique_by_source(cluster):
@@ -211,17 +228,38 @@ def unique_by_source(cluster):
     return result
 
 
-REWRITE_PROMPT = """Ты — редактор новостного телеграм-канала. Ниже сообщения разных изданий
-об одном и том же событии. Напиши по-русски:
-- headline: короткий нейтральный заголовок (до 100 символов);
-- text: 2–3 предложения о том, что произошло и почему это важно.
-Используй только факты из сообщений, ничего не придумывай. Без оценок, эмоций и кликбейта.
-Если издания расходятся в деталях, укажи только то, в чём они сходятся."""
+ASSESS_PROMPT = """Ты — строгий выпускающий редактор новостного телеграм-канала для жителей России.
+Ниже сообщения разных изданий об одном и том же событии. Сделай две вещи.
 
-REWRITE_SCHEMA = {
+1. Оцени важность. Главный вопрос: может ли обычный житель России спокойно прожить,
+не узнав об этом? Или это реально может повлиять на его жизнь, деньги, безопасность,
+права, работу, поездки, связь? Шкала:
+- 9–10: касается почти каждого: война, мобилизация, крупный теракт или катастрофа,
+  обвал рубля, новые налоги, изменения пенсий, ограничения на выезд или интернет.
+- 7–8: заметно влияет на многих: решение ЦБ по ключевой ставке, рост цен и тарифов,
+  блокировка популярных сервисов, новые законы для широкого круга людей, крупные
+  международные события с прямыми последствиями для России.
+- 4–6: интересно, но жизнь не меняет: заявления политиков, переговоры и встречи,
+  происшествия без широких последствий, новости отдельных компаний.
+- 1–3: можно не знать: шоу-бизнес, спорт, курьёзы, местные события, мнения.
+Будь строг: большинство новостей — 6 и ниже. Не завышай оценку из-за громких слов.
+
+2. Перескажи новость по-русски:
+- headline: короткий нейтральный заголовок (до 100 символов);
+- text: 2–3 предложения: что произошло и чем это важно для людей.
+Используй только факты из сообщений, ничего не придумывай. Без оценок, эмоций и кликбейта.
+
+Сначала заполни reason (одно предложение: кого и как это касается), затем importance."""
+
+ASSESS_SCHEMA = {
     "type": "object",
-    "properties": {"headline": {"type": "string"}, "text": {"type": "string"}},
-    "required": ["headline", "text"],
+    "properties": {
+        "reason": {"type": "string"},
+        "importance": {"type": "integer"},
+        "headline": {"type": "string"},
+        "text": {"type": "string"},
+    },
+    "required": ["reason", "importance", "headline", "text"],
 }
 
 
@@ -249,10 +287,9 @@ def ensure_model():
             time.sleep(10)
 
 
-def rewrite(cluster):
-    """Пересказ сюжета локальной нейросетью. None — если она не настроена или сбоит."""
-    if not os.environ.get("OLLAMA_URL"):
-        return None
+def assess(cluster):
+    """Оценка важности и пересказ сюжета нейросетью.
+    Возвращает dict(reason, importance, headline, text) или None при сбое."""
     material = "\n".join(
         f"- {m['source_name']}: {m['title']}. {m['summary']}" for m in unique_by_source(cluster)[:8]
     )
@@ -260,27 +297,29 @@ def rewrite(cluster):
         result = ollama_request("/api/chat", {
             "model": os.environ.get("OLLAMA_MODEL", "qwen2.5:3b"),
             "messages": [
-                {"role": "system", "content": REWRITE_PROMPT},
+                {"role": "system", "content": ASSESS_PROMPT},
                 {"role": "user", "content": material},
             ],
-            "format": REWRITE_SCHEMA,
+            "format": ASSESS_SCHEMA,
             "stream": False,
             "options": {"temperature": 0.2},
         }, timeout=600)
         data = json.loads(result["message"]["content"])
-        headline, text = data["headline"].strip(), data["text"].strip()
-        if not headline or not text:
+        data["importance"] = max(1, min(10, int(data["importance"])))
+        data["headline"] = data["headline"].strip()[:200]
+        data["text"] = data["text"].strip()[:1500]
+        if not data["headline"] or not data["text"]:
             return None
-        return headline[:200], text[:1500]
+        return data
     except Exception as e:
-        print(f"[warn] нейросеть не сработала, публикую без пересказа: {e}", file=sys.stderr)
+        print(f"[warn] нейросеть не сработала: {e}", file=sys.stderr)
         return None
 
 
-def format_post(cluster, rewritten=None):
+def format_post(cluster, assessment=None):
     main = cluster["main"]
-    if rewritten:
-        headline, body = rewritten
+    if assessment:
+        headline, body = assessment["headline"], assessment["text"]
     else:
         headline = main["title"]
         body = main["summary"] if not main["summary"].startswith(main["title"]) else ""
@@ -318,10 +357,47 @@ def check_feeds():
             print(f"ОШИБКА      {url}  ({e})")
 
 
+def pick_stories(clusters, state, idf, dry_run):
+    """Отбирает сюжеты для публикации. Возвращает [(важность, сюжет, оценка)]."""
+    use_llm = bool(os.environ.get("OLLAMA_URL"))
+    min_sources = int(os.environ.get("MIN_SOURCES", "3" if use_llm else str(NO_LLM_MIN_SOURCES)))
+    min_importance = int(os.environ.get("MIN_IMPORTANCE", "7"))
+
+    candidates = [c for c in clusters if len(c["sources"]) >= min_sources]
+    print(f"Кандидатов ({min_sources}+ источников): {len(candidates)}")
+    picked, assessed = [], 0
+    for c in candidates:
+        n = len(c["sources"])
+        if find_same(c, state["posted"], idf):
+            continue
+        prev = find_same(c, state["rejected"], idf)
+        if prev and n < prev["sources"] + REASSESS_GROWTH:
+            continue  # уже признан неважным, и с тех пор почти никто не подхватил
+        if not use_llm:
+            picked.append((0, c, None))
+            continue
+        if assessed >= MAX_ASSESS:
+            break
+        assessed += 1
+        a = assess(c)
+        if a is None:
+            # нейросеть сбоит — действуем по старому правилу «пишут многие»
+            if n >= NO_LLM_MIN_SOURCES:
+                picked.append((0, c, None))
+            continue
+        verdict = "ПУБЛИКУЮ" if a["importance"] >= min_importance else "пропускаю"
+        print(f"  [{a['importance']:2d}/10, {n} ист.] {verdict}: {a['headline']} — {a['reason']}")
+        if a["importance"] >= min_importance:
+            picked.append((a["importance"], c, a))
+        elif not dry_run:
+            state["rejected"].append(remember(c, importance=a["importance"]))
+    picked.sort(key=lambda x: (x[0], len(x[1]["sources"])), reverse=True)
+    return picked
+
+
 def run_once(dry_run):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHANNEL_ID")
-    min_sources = int(os.environ.get("MIN_SOURCES", "5"))
     max_posts = int(os.environ.get("MAX_POSTS", "3"))
     window = float(os.environ.get("WINDOW_HOURS", "6")) * 3600
 
@@ -334,29 +410,24 @@ def run_once(dry_run):
     print(f"Новостей за окно: {len(items)}, сюжетов: {len(clusters)}")
 
     if dry_run:
-        print(f"\nКрупнейшие сюжеты (публикуются при {min_sources}+ источниках):")
+        print("\nКрупнейшие сюжеты:")
         for c in clusters[:10]:
-            mark = "уже было" if already_posted(c, state["posted"], idf) else ""
+            mark = "уже было" if find_same(c, state["posted"], idf) else ""
             print(f"  {len(c['sources']):2d} ист. | {c['main']['title']}  {mark}")
-        top = next((c for c in clusters if len(c["sources"]) >= min_sources), None)
-        if top and os.environ.get("OLLAMA_URL"):
-            print("\nПример поста для первого сюжета:\n")
-            print(format_post(top, rewrite(top)))
+        print()
+
+    picked = pick_stories(clusters, state, idf, dry_run)
+
+    if dry_run:
+        for _, c, a in picked[:max_posts]:
+            print("\n--- пост ---\n" + format_post(c, a))
         return
 
     posted = 0
-    for c in clusters:
-        if len(c["sources"]) < min_sources or posted >= max_posts:
-            break
-        if already_posted(c, state["posted"], idf):
-            continue
-        send_telegram(token, chat_id, format_post(c, rewrite(c)))
+    for _, c, a in picked[:max_posts]:
+        send_telegram(token, chat_id, format_post(c, a))
         posted += 1
-        state["posted"].append({
-            "time": time.time(),
-            "links": [m["link"] for m in c["members"]],
-            "titles": [sorted(m["tokens"]) for m in c["members"]],
-        })
+        state["posted"].append(remember(c))
         save_state(state, window)  # сохраняем сразу, чтобы при сбое не запостить повторно
         time.sleep(1)
     print(f"Опубликовано: {posted}")
