@@ -312,24 +312,28 @@ def describe(a):
     return ", ".join(("+" if a[k] else "-") + name for k, name in CHECKS.items())
 
 
-def ollama_request(path, body, timeout):
+def ollama_request(path, body=None, timeout=60):
+    """Запрос к Ollama: POST с JSON, если передан body, иначе GET."""
     url = os.environ["OLLAMA_URL"].rstrip("/") + path
-    req = urllib.request.Request(url, data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read())
 
 
 def ensure_model():
-    """Ждёт запуска Ollama и скачивает модель, если её ещё нет (один раз, ~2 ГБ)."""
+    """Ждёт запуска Ollama и скачивает модель, только если её ещё нет на диске (~2 ГБ)."""
     if not os.environ.get("OLLAMA_URL"):
         return
     model = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
+    wanted = model if ":" in model else model + ":latest"
     for attempt in range(30):
         try:
-            print(f"Проверяю модель {model} (при первом запуске скачивание займёт время)...")
-            ollama_request("/api/pull", {"model": model, "stream": False}, timeout=3600)
-            print("Модель готова")
+            names = {m["name"] for m in ollama_request("/api/tags").get("models", [])}
+            if wanted not in names:
+                print(f"Скачиваю модель {model} (~2 ГБ, один раз, займёт несколько минут)...")
+                ollama_request("/api/pull", {"model": model, "stream": False}, timeout=3600)
+            print(f"Модель {model} готова")
             return
         except Exception as e:
             print(f"[warn] Ollama недоступна ({e}), повтор через 10 с", file=sys.stderr)
@@ -513,7 +517,14 @@ def test_model():
     if not os.environ.get("OLLAMA_URL"):
         sys.exit("Не задан OLLAMA_URL — нейросеть не настроена")
     ensure_model()
-    print(f"Модель: {os.environ.get('OLLAMA_MODEL', 'qwen2.5:3b')}\n")
+    model = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
+    # загружаем модель в память заранее, чтобы время загрузки не портило замер скорости
+    started = time.time()
+    try:
+        ollama_request("/api/generate", {"model": model, "prompt": "", "stream": False}, timeout=600)
+    except Exception as e:
+        print(f"[warn] не удалось загрузить модель: {e}", file=sys.stderr)
+    print(f"Загрузка модели в память: {time.time() - started:.1f} с\n")
     ok, total_time = 0, 0.0
     for titles, expected in TEST_CASES:
         members = [{"source": f"s{i}", "source_name": f"Издание {i + 1}", "title": t, "summary": "",
@@ -534,7 +545,7 @@ def test_model():
             print(f"      пост: {a['headline']} — {a['text']} Что это значит: {a['impact']}")
         print()
     n = len(TEST_CASES)
-    print(f"Итог: {ok}/{n} решений верны, в среднем {total_time / n:.0f} с на сюжет")
+    print(f"Итог: {ok}/{n} решений верны, в среднем {total_time / n:.1f} с на сюжет")
     if ok < n * 0.8:
         print("Модель отбирает неточно. Попробуйте OLLAMA_MODEL=qwen2.5:7b (нужно ~8 ГБ памяти).")
 
