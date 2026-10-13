@@ -1,0 +1,9 @@
+# RSS-ленты, по одной на строку. Строки с # игнорируются.
+https://feeds.bbci.co.uk/news/world/rss.xml
+https://www.aljazeera.com/xml/rss/all.xml
+https://rss.nytimes.com/services/xml/rss/nyt/World.xml
+https://feeds.npr.org/1004/rss.xml
+https://www.theguardian.com/world/rss
+https://meduza.io/rss/all
+https://www.bbc.com/russian/index.xml
+https://tass.ru/rss/v2.xml
