@@ -1,9 +1,20 @@
 # RSS-ленты, по одной на строку. Строки с # игнорируются.
-https://feeds.bbci.co.uk/news/world/rss.xml
-https://www.aljazeera.com/xml/rss/all.xml
-https://rss.nytimes.com/services/xml/rss/nyt/World.xml
-https://feeds.npr.org/1004/rss.xml
-https://www.theguardian.com/world/rss
-https://meduza.io/rss/all
-https://www.bbc.com/russian/index.xml
+# Проверить, какие работают: python bot.py --check-feeds
+# Чем больше разных независимых редакций, тем точнее отбор.
+# Важно: ленты должны быть на одном языке — сравниваются слова заголовков.
 https://tass.ru/rss/v2.xml
+https://ria.ru/export/rss2/archive/index.xml
+https://www.interfax.ru/rss.asp
+https://www.kommersant.ru/RSS/news.xml
+https://rssexport.rbc.ru/rbcnews/news/30/full.rss
+https://lenta.ru/rss/news
+https://iz.ru/xml/rss/all.xml
+https://www.vedomosti.ru/rss/news
+https://www.gazeta.ru/export/rss/lenta.xml
+https://www.mk.ru/rss/index.xml
+https://rg.ru/xml/index.xml
+https://meduza.io/rss/all
+https://feeds.bbci.co.uk/russian/rss.xml
+https://rss.dw.com/rdf/rss-ru-all
+https://www.svoboda.org/api/zrqiteuuir
+https://www.fontanka.ru/fontanka.rss

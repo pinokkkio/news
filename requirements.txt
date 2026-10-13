@@ -1,2 +1,1 @@
-anthropic>=1.13
 feedparser>=6.0
