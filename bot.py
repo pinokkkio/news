@@ -229,7 +229,7 @@ def unique_by_source(cluster):
     return result
 
 
-ASSESS_PROMPT = """Ты — очень строгий редактор телеграм-канала, который публикует только новости,
+CLASSIFY_PROMPT = """Ты — очень строгий редактор телеграм-канала, который публикует только новости,
 без которых жителю России будет хуже. Не «интересные» и не «громкие», а те, что требуют
 внимания каждого. Канал должен молчать почти всегда; пропустить лишнее хуже, чем промолчать.
 
@@ -253,26 +253,34 @@ is_fact — это уже принятое решение или свершив�
 Примеры «нет»: Лавров встретился с коллегой; Песков прокомментировал; землетрясение в Чили;
 в Госдуму внесли законопроект; сборная выиграла матч; в регионе отключат воду.
 
-Затем перескажи новость по-русски, только фактами из сообщений, без эмоций и кликбейта:
+Сначала заполни who_is_affected (кого именно касается, 3–7 слов), потом отвечай на вопросы."""
+
+REWRITE_PROMPT = """Ты — редактор новостного телеграм-канала для жителей России. Ниже сообщения
+разных изданий об одном событии. Перескажи новость по-русски, только фактами из сообщений,
+без эмоций и кликбейта:
 - headline: короткий нейтральный заголовок (до 100 символов);
 - text: 1–2 предложения: что произошло;
-- impact: одно предложение: что это значит для обычного человека и на что обратить внимание.
+- impact: одно предложение: что это значит для обычного человека и на что обратить внимание."""
 
-Сначала заполни who_is_affected (кого именно касается), потом отвечай на вопросы."""
-
-ASSESS_SCHEMA = {
+CLASSIFY_SCHEMA = {
     "type": "object",
     "properties": {
         "who_is_affected": {"type": "string"},
         "affects_everyone": {"type": "boolean"},
         "requires_attention": {"type": "boolean"},
         "is_fact": {"type": "boolean"},
+    },
+    "required": ["who_is_affected", "affects_everyone", "requires_attention", "is_fact"],
+}
+
+REWRITE_SCHEMA = {
+    "type": "object",
+    "properties": {
         "headline": {"type": "string"},
         "text": {"type": "string"},
         "impact": {"type": "string"},
     },
-    "required": ["who_is_affected", "affects_everyone", "requires_attention", "is_fact",
-                 "headline", "text", "impact"],
+    "required": ["headline", "text", "impact"],
 }
 
 CHECKS = {"affects_everyone": "касается всех", "requires_attention": "требует внимания",
@@ -312,40 +320,75 @@ def ensure_model():
             time.sleep(10)
 
 
-def assess(cluster):
-    """Оценка важности и пересказ сюжета нейросетью.
-    Возвращает ответ модели (см. ASSESS_SCHEMA) или None при сбое."""
-    material = "\n".join(
-        f"- {m['source_name']}: {m['title']}. {m['summary']}" for m in unique_by_source(cluster)[:8]
-    )
+def material(cluster):
+    """Текст сюжета для нейросети: до 5 изданий, описания обрезаны — меньше читать модели."""
+    lines = []
+    for m in unique_by_source(cluster)[:5]:
+        line = f"- {m['source_name']}: {m['title'].rstrip('.')}."
+        summary = m["summary"]
+        if summary and not summary.startswith(m["title"]):
+            if len(summary) > 150:
+                summary = summary[:150].rsplit(" ", 1)[0] + "…"
+            line += f" {summary}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def ask_model(prompt, schema, cluster):
+    result = ollama_request("/api/chat", {
+        "model": os.environ.get("OLLAMA_MODEL", "qwen2.5:3b"),
+        "messages": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": material(cluster)},
+        ],
+        "format": schema,
+        "stream": False,
+        "options": {"temperature": 0.2},
+    }, timeout=600)
+    return json.loads(result["message"]["content"])
+
+
+def classify(cluster):
+    """Шаг 1: короткий ответ «кого касается» и три да/нет. None — при сбое."""
     try:
-        result = ollama_request("/api/chat", {
-            "model": os.environ.get("OLLAMA_MODEL", "qwen2.5:3b"),
-            "messages": [
-                {"role": "system", "content": ASSESS_PROMPT},
-                {"role": "user", "content": material},
-            ],
-            "format": ASSESS_SCHEMA,
-            "stream": False,
-            "options": {"temperature": 0.2},
-        }, timeout=600)
-        data = json.loads(result["message"]["content"])
+        data = ask_model(CLASSIFY_PROMPT, CLASSIFY_SCHEMA, cluster)
         for k in CHECKS:
             data[k] = data[k] is True
-        data["headline"] = data["headline"].strip()[:200]
-        data["text"] = data["text"].strip()[:1500]
-        data["impact"] = data.get("impact", "").strip()[:500]
-        if not data["headline"] or not data["text"]:
-            return None
+        data["who_is_affected"] = str(data.get("who_is_affected", "")).strip()[:200]
         return data
     except Exception as e:
         print(f"[warn] нейросеть не сработала: {e}", file=sys.stderr)
         return None
 
 
+def rewrite(cluster):
+    """Шаг 2 (только для прошедших отбор): заголовок, пересказ, «что это значит»."""
+    try:
+        data = ask_model(REWRITE_PROMPT, REWRITE_SCHEMA, cluster)
+        result = {
+            "headline": data["headline"].strip()[:200],
+            "text": data["text"].strip()[:1500],
+            "impact": data.get("impact", "").strip()[:500],
+        }
+        return result if result["headline"] and result["text"] else None
+    except Exception as e:
+        print(f"[warn] нейросеть не смогла пересказать, публикую заголовок из ленты: {e}",
+              file=sys.stderr)
+        return None
+
+
+def assess(cluster):
+    """Решение о публикации и, если публикуем, пересказ. Пересказ пишется только для
+    прошедших отбор: генерация текста — самая медленная часть работы модели."""
+    a = classify(cluster)
+    if a is not None and verdict(a):
+        a.update(rewrite(cluster) or {})
+    return a
+
+
 def format_post(cluster, assessment=None):
     main = cluster["main"]
-    if assessment:
+    if assessment and assessment.get("headline"):
         headline, body = assessment["headline"], assessment["text"]
         if assessment["impact"]:
             body += f"\n\nЧто это значит: {assessment['impact']}"
@@ -411,7 +454,7 @@ def pick_stories(clusters, state, idf, dry_run):
         if a is None:
             continue  # нейросеть сбоит — ничего не публикуем, попробуем в следующий раз
         ok = verdict(a)
-        print(f"  [{n} ист.] {'ПУБЛИКУЮ' if ok else 'пропускаю'}: {a['headline']}\n"
+        print(f"  [{n} ист.] {'ПУБЛИКУЮ' if ok else 'пропускаю'}: {c['main']['title']}\n"
               f"      {describe(a)} | касается: {a['who_is_affected']}")
         if ok:
             picked.append((c, a))
@@ -471,7 +514,7 @@ def test_model():
         print(f"{'OK  ' if got == expected else 'МИМО'}  {'опубликовал бы' if got else 'пропустил бы'}"
               f" (надо {'публиковать' if expected else 'пропустить'}):  {titles[0]}")
         print(f"      {describe(a)} | касается: {a['who_is_affected']}")
-        if got:
+        if got and a.get("headline"):
             print(f"      пост: {a['headline']} — {a['text']} Что это значит: {a['impact']}")
         print()
     n = len(TEST_CASES)
