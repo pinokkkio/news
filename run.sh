@@ -9,7 +9,7 @@ if [ ! -f .env ]; then
   exit 1
 fi
 
-bot() { docker compose run --rm --build bot python bot.py "$@"; }
+bot() { docker compose build -q bot && docker compose run --rm bot python bot.py "$@"; }
 
 case "${1:-help}" in
   test)    docker compose up -d ollama && bot --test-model ;;
