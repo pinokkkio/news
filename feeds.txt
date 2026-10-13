@@ -13,8 +13,8 @@ https://www.vedomosti.ru/rss/news
 https://www.gazeta.ru/export/rss/lenta.xml
 https://www.mk.ru/rss/index.xml
 https://rg.ru/xml/index.xml
-https://meduza.io/rss/all
-https://feeds.bbci.co.uk/russian/rss.xml
-https://rss.dw.com/rdf/rss-ru-all
-https://www.svoboda.org/api/zrqiteuuir
 https://www.fontanka.ru/fontanka.rss
+https://www.kp.ru/rss/allsections.xml
+https://aif.ru/rss/news.php
+https://www.ng.ru/rss/
+https://russian.rt.com/rss
